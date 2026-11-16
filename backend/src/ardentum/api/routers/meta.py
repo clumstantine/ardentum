@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+import os
+
+from fastapi import APIRouter
+from sqlalchemy import text
+
+from ardentum import __version__
+from ardentum.api import schemas as s
+from ardentum.api.deps import DbDep, SettingsDep
+from ardentum.services import usage
+
+router = APIRouter(tags=["meta"])
+METHODOLOGY_VERSION = "2026.1"
+
+
+@router.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/health/db")
+def health_db(db: DbDep) -> dict[str, str]:
+    """Touches the database; a daily ping keeps free-tier databases from pausing."""
+    db.execute(text("SELECT 1"))
+    return {"status": "ok", "database": "ok"}
+
+
+@router.get("/meta", response_model=s.MetaOut)
+def meta(settings: SettingsDep) -> s.MetaOut:
+    return s.MetaOut(
+        version=__version__,
+        environment=settings.env.value,
+        auth_mode=settings.auth_mode.value,
+        supabase_url=settings.supabase_url,
+        live_data_available=bool(settings.tiingo_api_key),
+        open_esg_available=bool(settings.wikirate_publishable_key and settings.wikirate_api_token),
+        methodology_version=METHODOLOGY_VERSION,
+        commit=settings.build_commit or os.environ.get("RENDER_GIT_COMMIT") or None,
+    )
+
+
+@router.get("/usage", response_model=s.UsageOut)
+def usage_counts(db: DbDep) -> s.UsageOut:
+    """Public, anonymous usage statistics: completed calculations and saves per kind."""
+    return s.UsageOut.model_validate(usage.summary(db))

@@ -1,0 +1,23 @@
+import type { Metadata } from "next";
+import Link from "next/link";
+
+import { buttonClass } from "@/lib/classes";
+
+export const metadata: Metadata = { title: "Page not found" };
+
+export default function NotFound() {
+  return (
+    <main className="mx-auto max-w-xl space-y-4 px-4 py-16">
+      <h1 className="type-title-1 text-ink">Page not found</h1>
+      <p className="text-sm leading-relaxed text-ink-2">There is no page at this address. It may have moved, or the link may be mistyped.</p>
+      <div className="flex flex-wrap gap-2">
+        <Link href="/app" className={buttonClass("primary")}>
+          Open the workspace
+        </Link>
+        <Link href="/" className={buttonClass("secondary")}>
+          Home page
+        </Link>
+      </div>
+    </main>
+  );
+}

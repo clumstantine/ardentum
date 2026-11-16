@@ -1,0 +1,16 @@
+**/node_modules
+**/.next
+**/out
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/playwright-report
+**/test-results
+.git
+# Local settings and data never go into an image.
+**/.env
+**/.env.*
+!**/.env.example
+**/*.sqlite3
+**/.coverage

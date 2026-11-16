@@ -1,0 +1,578 @@
+"""Risk and performance metrics.
+
+All metrics take a series of *simple* per-period returns and an explicit
+``periods_per_year`` so that annualisation is never implicit. Rates such as the
+risk-free rate are effective annual rates and are converted to per-period rates
+geometrically (``(1 + R)^(1/P) - 1``).
+
+Definitions (``P`` = periods per year, ``n`` = number of observations):
+
+* Annualised volatility: ``std(r, ddof=1) * sqrt(P)`` (square-root-of-time rule,
+  which assumes serially uncorrelated returns).
+* Sharpe ratio (Sharpe 1994, ex-post): ``mean(r - rf) / std(r - rf) * sqrt(P)``.
+* Sortino ratio (Sortino & Price 1994): ``(mean(r) - m) / DD * sqrt(P)`` with target
+  downside deviation ``DD = sqrt(mean(min(r - m, 0)^2))`` over *all* observations.
+* Maximum drawdown: ``min_t (W_t / max_{s<=t} W_s - 1)`` on the wealth index with the
+  initial value included.
+* Beta: ``cov(r_a, r_m) / var(r_m)``.
+* Tracking error: ``std(r_p - r_b, ddof=1) * sqrt(P)``.
+* Historical VaR / CVaR at level ``c``: the loss not exceeded with probability ``c``
+  and the mean loss beyond it, reported as positive fractions of value.
+* Sharpe ratio interval and difference test: delta method on the first two moments of
+  excess returns with a Newey-West (Bartlett kernel) long-run covariance, following
+  Lo (2002) and Ledoit & Wolf (2008, section 3.1). With independent normal returns the
+  standard error reduces to Lo's ``sqrt((1 + SR^2 / 2) / T)``; unlike that formula it
+  allows fat tails, skew and autocorrelation.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, replace
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+from ardentum.quant.errors import InvalidInputError, UndefinedMetricError
+from ardentum.quant.returns import (
+    annual_rate_to_periodic,
+    annualised_return,
+    validate_returns,
+    wealth_index,
+)
+
+ArrayLike1D = pd.Series | np.ndarray
+
+# Standard deviations below this are treated as zero (constant series).
+_ZERO_VOL_TOL = 1e-14
+
+
+def _as_array(returns: ArrayLike1D, *, min_obs: int = 2, name: str = "returns") -> np.ndarray:
+    r = np.asarray(returns, dtype=float)
+    if r.ndim != 1:
+        raise InvalidInputError(f"{name} must be one-dimensional.")
+    validate_returns(r, min_obs=min_obs, name=name)
+    return r
+
+
+def annualised_volatility(returns: ArrayLike1D, periods_per_year: int) -> float:
+    """Sample standard deviation (ddof=1) scaled by ``sqrt(P)``."""
+    r = _as_array(returns)
+    return float(r.std(ddof=1) * np.sqrt(periods_per_year))
+
+
+def covariance_matrix(returns: pd.DataFrame, periods_per_year: int) -> pd.DataFrame:
+    """Annualised sample covariance matrix (ddof=1)."""
+    arr = returns.to_numpy(dtype=float)
+    validate_returns(arr, min_obs=2)
+    cov = np.cov(arr, rowvar=False, ddof=1) * periods_per_year
+    cov = np.atleast_2d(cov)
+    return pd.DataFrame(cov, index=returns.columns, columns=returns.columns)
+
+
+def correlation_matrix(returns: pd.DataFrame) -> pd.DataFrame:
+    """Pearson correlation matrix. Raises if any asset has zero variance."""
+    arr = returns.to_numpy(dtype=float)
+    validate_returns(arr, min_obs=2)
+    std = arr.std(axis=0, ddof=1)
+    constant = [str(c) for c, s in zip(returns.columns, std, strict=True) if s < _ZERO_VOL_TOL]
+    if constant:
+        raise UndefinedMetricError(
+            f"Correlation is undefined for assets with constant returns: {', '.join(constant)}."
+        )
+    corr = np.atleast_2d(np.corrcoef(arr, rowvar=False))
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=returns.columns, columns=returns.columns)
+
+
+def correlation_matrix_with_gaps(returns: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """Pearson correlations of the columns of ``returns``, NaN where undefined.
+
+    A column with constant returns has no correlation with anything (zero variance), so
+    its row and column are NaN; every other pair keeps its correlation. Returns the matrix
+    and the indices of the constant columns, so the caller can say why cells are missing.
+    """
+    arr = np.atleast_2d(np.asarray(returns, dtype=float))
+    validate_returns(arr, min_obs=2)
+    constant = [int(i) for i in np.flatnonzero(arr.std(axis=0, ddof=1) < _ZERO_VOL_TOL)]
+    n = arr.shape[1]
+    corr = np.full((n, n), np.nan)
+    live = [i for i in range(n) if i not in constant]
+    if live:
+        sub = np.atleast_2d(np.corrcoef(arr[:, live], rowvar=False))
+        np.fill_diagonal(sub, 1.0)
+        corr[np.ix_(live, live)] = np.clip(sub, -1.0, 1.0)
+    return corr, constant
+
+
+def beta(asset_returns: ArrayLike1D, market_returns: ArrayLike1D) -> float:
+    """OLS beta of an asset against a market/benchmark return series."""
+    a = _as_array(asset_returns, name="asset returns")
+    m = _as_array(market_returns, name="market returns")
+    if a.shape != m.shape:
+        raise InvalidInputError("Asset and market returns must have the same length and dates.")
+    var_m = m.var(ddof=1)
+    if var_m < _ZERO_VOL_TOL**2:
+        raise UndefinedMetricError("Beta is undefined: the market return series has zero variance.")
+    return float(np.cov(a, m, ddof=1)[0, 1] / var_m)
+
+
+def sharpe_ratio(returns: ArrayLike1D, periods_per_year: int, risk_free_rate: float = 0.0) -> float:
+    """Annualised ex-post Sharpe ratio using an effective annual risk-free rate."""
+    r = _as_array(returns)
+    excess = r - annual_rate_to_periodic(risk_free_rate, periods_per_year)
+    sd = excess.std(ddof=1)
+    if sd < _ZERO_VOL_TOL:
+        raise UndefinedMetricError("Sharpe ratio is undefined: returns have zero volatility.")
+    return float(excess.mean() / sd * np.sqrt(periods_per_year))
+
+
+# Fewer observations than this make the asymptotic Sharpe standard error unreliable.
+MIN_OBS_SHARPE_INFERENCE = 24
+
+
+def newey_west_lags(t: int) -> int:
+    """Newey and West (1994) rule of thumb for the number of autocovariance lags."""
+    return int(4 * (t / 100) ** (2 / 9))
+
+
+def _long_run_covariance(y: np.ndarray, lags: int) -> np.ndarray:
+    """Newey-West (Bartlett kernel) long-run covariance of the demeaned columns of ``y``."""
+    t = y.shape[0]
+    psi = y.T @ y / t
+    for j in range(1, lags + 1):
+        gamma = y[j:].T @ y[:-j] / t
+        psi += (1.0 - j / (lags + 1)) * (gamma + gamma.T)
+    return np.asarray(psi)
+
+
+def _excess_for_inference(
+    returns: ArrayLike1D, periods_per_year: int, risk_free_rate: float, name: str
+) -> np.ndarray:
+    r = _as_array(returns, name=name)
+    if r.shape[0] < MIN_OBS_SHARPE_INFERENCE:
+        raise UndefinedMetricError(
+            f"A Sharpe ratio interval needs at least {MIN_OBS_SHARPE_INFERENCE} returns; "
+            f"{name} has {r.shape[0]}."
+        )
+    return r - annual_rate_to_periodic(risk_free_rate, periods_per_year)
+
+
+@dataclass(frozen=True)
+class SharpeInterval:
+    """Confidence interval for an annualised Sharpe ratio (``low`` to ``high``)."""
+
+    sharpe: float
+    low: float
+    high: float
+    standard_error: float
+    confidence: float
+    lags: int
+
+
+def sharpe_ratio_interval(
+    returns: ArrayLike1D,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    confidence: float = 0.95,
+    lags: int | None = None,
+) -> SharpeInterval:
+    """Symmetric confidence interval ``SR +/- z SE`` for the annualised Sharpe ratio.
+
+    ``SR = mu / sqrt(g - mu^2)`` with ``g = E[x^2]`` of the excess returns ``x``; the
+    gradient ``(g / v^1.5, -mu / (2 v^1.5))`` and the long-run covariance of
+    ``(x - mu, x^2 - g)`` give its variance by the delta method. ``lags`` defaults to
+    :func:`newey_west_lags`. Raises :class:`UndefinedMetricError` for constant returns or
+    fewer than :data:`MIN_OBS_SHARPE_INFERENCE` observations.
+    """
+    _check_confidence(confidence)
+    x = _excess_for_inference(returns, periods_per_year, risk_free_rate, "returns")
+    sr = sharpe_ratio(returns, periods_per_year, risk_free_rate)
+    t = x.shape[0]
+    lags = newey_west_lags(t) if lags is None else lags
+    mu, g = float(x.mean()), float((x**2).mean())
+    v = g - mu**2
+    grad = np.array([g / v**1.5, -0.5 * mu / v**1.5])
+    psi = _long_run_covariance(np.column_stack([x - mu, x**2 - g]), lags)
+    se = float(np.sqrt(max(float(grad @ psi @ grad), 0.0) / t) * np.sqrt(periods_per_year))
+    z = float(stats.norm.ppf(0.5 + confidence / 2.0))
+    return SharpeInterval(sr, sr - z * se, sr + z * se, se, confidence, lags)
+
+
+@dataclass(frozen=True)
+class SharpeDifference:
+    """Test of equal Sharpe ratios: ``difference`` is a minus b, annualised."""
+
+    difference: float
+    standard_error: float
+    z: float
+    p_value: float
+    lags: int
+
+
+def sharpe_difference_test(
+    returns_a: ArrayLike1D,
+    returns_b: ArrayLike1D,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    lags: int | None = None,
+) -> SharpeDifference:
+    """Two-sided test that two strategies over the same dates have equal Sharpe ratios.
+
+    Ledoit and Wolf (2008, section 3.1): the difference is a function of the four
+    moments ``(mu_a, mu_b, g_a, g_b)``; its standard error comes from the delta method
+    with a Newey-West long-run covariance of those moments (Ledoit and Wolf prefer a
+    quadratic-spectral kernel with prewhitening; the Bartlett kernel is the simpler,
+    standard choice). Robust to fat tails, skew, autocorrelation and the correlation
+    between the two series, which the Jobson-Korkie-Memmel test assumes away.
+    """
+    a = _excess_for_inference(returns_a, periods_per_year, risk_free_rate, "strategy returns")
+    b = _excess_for_inference(returns_b, periods_per_year, risk_free_rate, "benchmark returns")
+    if a.shape != b.shape:
+        raise InvalidInputError("Both return series must cover the same dates.")
+    diff = sharpe_ratio(returns_a, periods_per_year, risk_free_rate) - sharpe_ratio(
+        returns_b, periods_per_year, risk_free_rate
+    )
+    t = a.shape[0]
+    lags = newey_west_lags(t) if lags is None else lags
+    mu_a, mu_b = float(a.mean()), float(b.mean())
+    g_a, g_b = float((a**2).mean()), float((b**2).mean())
+    v_a, v_b = g_a - mu_a**2, g_b - mu_b**2
+    grad = np.array(
+        [g_a / v_a**1.5, -g_b / v_b**1.5, -0.5 * mu_a / v_a**1.5, 0.5 * mu_b / v_b**1.5]
+    )
+    y = np.column_stack([a - mu_a, b - mu_b, a**2 - g_a, b**2 - g_b])
+    psi = _long_run_covariance(y, lags)
+    se = float(np.sqrt(max(float(grad @ psi @ grad), 0.0) / t) * np.sqrt(periods_per_year))
+    if se < 1e-12:  # the same series twice: no evidence of a difference
+        return SharpeDifference(0.0, 0.0, 0.0, 1.0, lags)
+    z = diff / se
+    return SharpeDifference(diff, se, z, float(2.0 * stats.norm.sf(abs(z))), lags)
+
+
+@dataclass(frozen=True)
+class SharpeBootstrap:
+    """Bootstrap p-value for equal Sharpe ratios, with what is needed to reproduce it."""
+
+    p_value: float
+    resamples: int
+    block_length: int
+    seed: int
+
+
+def default_block_length(t: int) -> int:
+    """About ``T^(1/3)`` periods, the usual order for block bootstraps of means."""
+    return max(1, round(math.cbrt(t)))
+
+
+def _sharpe_difference_and_se(
+    a: np.ndarray, b: np.ndarray, block: int | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-period Sharpe difference and its delta-method standard error for each row of
+    ``a`` and ``b`` (shape ``(m, T)``). The long-run covariance of the moments is the
+    block estimate ``(1/l) sum_j z_j z_j'`` over ``l`` blocks of ``block`` periods, with
+    ``z_j`` the block sum divided by ``sqrt(block)`` (Ledoit and Wolf 2008, eq. 10)."""
+    t = a.shape[1]
+    mu_a, mu_b = a.mean(axis=1), b.mean(axis=1)
+    g_a, g_b = (a**2).mean(axis=1), (b**2).mean(axis=1)
+    v_a, v_b = g_a - mu_a**2, g_b - mu_b**2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        diff = mu_a / np.sqrt(v_a) - mu_b / np.sqrt(v_b)
+        grad = np.stack(
+            [g_a / v_a**1.5, -g_b / v_b**1.5, -0.5 * mu_a / v_a**1.5, 0.5 * mu_b / v_b**1.5],
+            axis=1,
+        )
+    y = np.stack(
+        [a - mu_a[:, None], b - mu_b[:, None], a**2 - g_a[:, None], b**2 - g_b[:, None]],
+        axis=2,
+    )
+    blk = block or 1
+    blocks = t // blk
+    z = y[:, : blocks * blk].reshape(y.shape[0], blocks, blk, 4).sum(axis=2) / np.sqrt(blk)
+    psi = np.einsum("mlk,mlj->mkj", z, z) / blocks
+    var = np.einsum("mk,mkj,mj->m", grad, psi, grad) / t
+    return diff, np.sqrt(np.maximum(var, 0.0))
+
+
+def sharpe_difference_bootstrap(
+    returns_a: ArrayLike1D,
+    returns_b: ArrayLike1D,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    *,
+    seed: int,
+    resamples: int = 999,
+    block_length: int | None = None,
+) -> SharpeBootstrap:
+    """Studentized circular block bootstrap test of equal Sharpe ratios.
+
+    Ledoit and Wolf (2008, section 3.2), recommended over the asymptotic test for short
+    histories. Pairs ``(a_t, b_t)`` are resampled in circular blocks of ``block_length``
+    periods (default :func:`default_block_length`), which keeps short-range dependence
+    and the correlation between the two series. With ``d = |D| / s(D)`` for the observed
+    difference ``D`` (HAC standard error, as in :func:`sharpe_difference_test`), the
+    p-value is ``(#{|D*_m - D| / s(D*_m) >= d} + 1) / (M + 1)``, where ``s(D*_m)`` is the
+    block standard error of each resample. Reproducible from ``seed``.
+    """
+    if not 99 <= resamples <= 9999:
+        raise InvalidInputError("The bootstrap needs between 99 and 9,999 resamples.")
+    a = _excess_for_inference(returns_a, periods_per_year, risk_free_rate, "strategy returns")
+    b = _excess_for_inference(returns_b, periods_per_year, risk_free_rate, "benchmark returns")
+    if a.shape != b.shape:
+        raise InvalidInputError("Both return series must cover the same dates.")
+    t = a.shape[0]
+    blk = default_block_length(t) if block_length is None else block_length
+    if not 1 <= blk <= t // 4:
+        raise InvalidInputError(
+            f"The block length must be between 1 and {t // 4} periods (a quarter of the "
+            f"{t} returns)."
+        )
+    observed = sharpe_difference_test(returns_a, returns_b, periods_per_year, risk_free_rate)
+    if observed.standard_error == 0.0:  # the same series twice
+        return SharpeBootstrap(1.0, resamples, blk, seed)
+    scale = np.sqrt(periods_per_year)
+    d_hat, _ = _sharpe_difference_and_se(a[None, :], b[None, :], None)
+    stat = abs(float(d_hat[0])) / (observed.standard_error / scale)
+    rng = np.random.default_rng(seed)
+    blocks = -(-t // blk)  # enough blocks to cover T, then cut to T
+    exceed = 0
+    for start in range(0, resamples, 100):  # in batches: memory stays small on 512 MB
+        m = min(100, resamples - start)
+        first = rng.integers(0, t, size=(m, blocks))
+        idx = ((first[:, :, None] + np.arange(blk)) % t).reshape(m, -1)[:, :t]
+        d_star, se_star = _sharpe_difference_and_se(a[idx], b[idx], blk)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            exceed += int(np.sum(np.abs(d_star - d_hat[0]) / se_star >= stat))
+    return SharpeBootstrap((exceed + 1) / (resamples + 1), resamples, blk, seed)
+
+
+def downside_deviation(
+    returns: ArrayLike1D, periods_per_year: int, minimum_acceptable_return: float = 0.0
+) -> float:
+    """Annualised target downside deviation below an annual minimum acceptable return."""
+    r = _as_array(returns)
+    mar = annual_rate_to_periodic(minimum_acceptable_return, periods_per_year)
+    shortfall = np.minimum(r - mar, 0.0)
+    return float(np.sqrt(np.mean(shortfall**2)) * np.sqrt(periods_per_year))
+
+
+def sortino_ratio(
+    returns: ArrayLike1D, periods_per_year: int, minimum_acceptable_return: float = 0.0
+) -> float:
+    """Annualised Sortino ratio relative to an annual minimum acceptable return (MAR)."""
+    r = _as_array(returns)
+    mar = annual_rate_to_periodic(minimum_acceptable_return, periods_per_year)
+    dd = float(np.sqrt(np.mean(np.minimum(r - mar, 0.0) ** 2)))
+    if dd < _ZERO_VOL_TOL:
+        raise UndefinedMetricError(
+            "Sortino ratio is undefined: no returns fell below the minimum acceptable return."
+        )
+    return float((r.mean() - mar) / dd * np.sqrt(periods_per_year))
+
+
+@dataclass(frozen=True)
+class Drawdown:
+    """Maximum drawdown and its timing (positions refer to the wealth index)."""
+
+    max_drawdown: float  # negative fraction, e.g. -0.35 for a 35% peak-to-trough loss
+    peak_position: int  # index into the wealth index (0 = initial value)
+    trough_position: int
+    recovery_position: int | None  # first position at/above the prior peak; None if unrecovered
+
+
+def drawdown_series(returns: ArrayLike1D) -> np.ndarray:
+    """Drawdown at each point of the wealth index (length ``n + 1``, starts at 0)."""
+    w = wealth_index(returns)
+    return w / np.maximum.accumulate(w) - 1.0
+
+
+def max_drawdown(returns: ArrayLike1D) -> Drawdown:
+    """Largest peak-to-trough decline of the wealth index, including the initial value."""
+    w = wealth_index(returns)
+    running_max = np.maximum.accumulate(w)
+    dd = w / running_max - 1.0
+    trough = int(np.argmin(dd))
+    if dd[trough] == 0.0:
+        return Drawdown(0.0, 0, 0, 0)
+    peak = int(np.argmax(w[: trough + 1]))
+    recovered = np.nonzero(w[trough:] >= w[peak])[0]
+    recovery = int(trough + recovered[0]) if recovered.size else None
+    return Drawdown(float(dd[trough]), peak, trough, recovery)
+
+
+def calmar_ratio(returns: ArrayLike1D, periods_per_year: int) -> float:
+    """CAGR divided by the absolute maximum drawdown."""
+    mdd = max_drawdown(returns).max_drawdown
+    if mdd == 0.0:
+        raise UndefinedMetricError("Calmar ratio is undefined: there was no drawdown.")
+    return annualised_return(returns, periods_per_year) / abs(mdd)
+
+
+def value_at_risk(
+    returns: ArrayLike1D, confidence: float = 0.95, *, method: str = "historical"
+) -> float:
+    """One-period Value at Risk as a positive loss fraction.
+
+    ``historical`` uses the empirical quantile (linear interpolation); ``gaussian``
+    uses ``-(mean + z_{1-c} * std)`` which assumes normally distributed returns.
+    """
+    r = _as_array(returns)
+    _check_confidence(confidence)
+    if method == "historical":
+        return float(-np.quantile(r, 1.0 - confidence))
+    if method == "gaussian":
+        z = stats.norm.ppf(1.0 - confidence)
+        return float(-(r.mean() + z * r.std(ddof=1)))
+    raise InvalidInputError(f"Unknown VaR method {method!r}.")
+
+
+def conditional_value_at_risk(returns: ArrayLike1D, confidence: float = 0.95) -> float:
+    """Historical expected shortfall: mean loss in the worst ``1 - c`` tail (positive)."""
+    r = _as_array(returns)
+    _check_confidence(confidence)
+    threshold = np.quantile(r, 1.0 - confidence)
+    tail = r[r <= threshold]
+    return float(-tail.mean())
+
+
+def tracking_error(
+    portfolio_returns: ArrayLike1D, benchmark_returns: ArrayLike1D, periods_per_year: int
+) -> float:
+    """Annualised standard deviation of active returns."""
+    p = _as_array(portfolio_returns, name="portfolio returns")
+    b = _as_array(benchmark_returns, name="benchmark returns")
+    if p.shape != b.shape:
+        raise InvalidInputError("Portfolio and benchmark returns must be aligned.")
+    return float((p - b).std(ddof=1) * np.sqrt(periods_per_year))
+
+
+def information_ratio(
+    portfolio_returns: ArrayLike1D, benchmark_returns: ArrayLike1D, periods_per_year: int
+) -> float:
+    """Annualised mean active return divided by tracking error."""
+    p = _as_array(portfolio_returns, name="portfolio returns")
+    b = _as_array(benchmark_returns, name="benchmark returns")
+    if p.shape != b.shape:
+        raise InvalidInputError("Portfolio and benchmark returns must be aligned.")
+    active = p - b
+    sd = active.std(ddof=1)
+    if sd < _ZERO_VOL_TOL:
+        raise UndefinedMetricError("Information ratio is undefined: tracking error is zero.")
+    return float(active.mean() / sd * np.sqrt(periods_per_year))
+
+
+def _check_confidence(confidence: float) -> None:
+    if not 0.5 <= confidence < 1.0:
+        raise InvalidInputError("Confidence level must be in [0.5, 1).")
+
+
+@dataclass(frozen=True)
+class MetricValue:
+    """A metric that may be undefined; ``reason`` explains why when ``value`` is None."""
+
+    value: float | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PerformanceSummary:
+    observations: int
+    periods_per_year: int
+    total_return: float
+    cagr: float
+    arithmetic_annual_return: float
+    annualised_volatility: float
+    sharpe_ratio: MetricValue
+    sortino_ratio: MetricValue
+    max_drawdown: float
+    calmar_ratio: MetricValue
+    var_95: float
+    cvar_95: float
+    skewness: MetricValue
+    excess_kurtosis: MetricValue
+    best_period: float
+    worst_period: float
+    positive_periods_fraction: float
+    beta: MetricValue | None = None
+    tracking_error: float | None = None
+    information_ratio: MetricValue | None = None
+    sharpe_interval: SharpeInterval | None = None
+    sharpe_interval_reason: str | None = None
+
+
+def _safe(fn: object, *args: object, **kwargs: object) -> MetricValue:
+    try:
+        return MetricValue(float(fn(*args, **kwargs)))  # type: ignore[operator]
+    except UndefinedMetricError as exc:
+        return MetricValue(None, str(exc))
+
+
+def performance_summary(
+    returns: ArrayLike1D,
+    periods_per_year: int,
+    risk_free_rate: float = 0.0,
+    benchmark_returns: ArrayLike1D | None = None,
+) -> PerformanceSummary:
+    """Compute the standard metric set; undefined metrics carry an explanation."""
+    r = _as_array(returns)
+    moments_defined = r.std(ddof=1) >= _ZERO_VOL_TOL and r.shape[0] >= 4
+    summary = PerformanceSummary(
+        observations=int(r.shape[0]),
+        periods_per_year=periods_per_year,
+        total_return=float(np.prod(1.0 + r) - 1.0),
+        cagr=annualised_return(r, periods_per_year),
+        arithmetic_annual_return=annualised_return(r, periods_per_year, method="arithmetic"),
+        annualised_volatility=annualised_volatility(r, periods_per_year),
+        sharpe_ratio=_safe(sharpe_ratio, r, periods_per_year, risk_free_rate),
+        sortino_ratio=_safe(sortino_ratio, r, periods_per_year, risk_free_rate),
+        max_drawdown=max_drawdown(r).max_drawdown,
+        calmar_ratio=_safe(calmar_ratio, r, periods_per_year),
+        var_95=value_at_risk(r, 0.95),
+        cvar_95=conditional_value_at_risk(r, 0.95),
+        skewness=(
+            MetricValue(float(stats.skew(r, bias=False)))
+            if moments_defined
+            else MetricValue(None, "Skewness needs at least 4 non-constant observations.")
+        ),
+        excess_kurtosis=(
+            MetricValue(float(stats.kurtosis(r, fisher=True, bias=False)))
+            if moments_defined
+            else MetricValue(None, "Kurtosis needs at least 4 non-constant observations.")
+        ),
+        best_period=float(r.max()),
+        worst_period=float(r.min()),
+        positive_periods_fraction=float(np.mean(r > 0.0)),
+    )
+    try:
+        interval = sharpe_ratio_interval(r, periods_per_year, risk_free_rate)
+        summary = replace(summary, sharpe_interval=interval)
+    except UndefinedMetricError as exc:
+        summary = replace(summary, sharpe_interval_reason=str(exc))
+    if benchmark_returns is None:
+        return summary
+    b = _as_array(benchmark_returns, name="benchmark returns")
+    return replace(
+        summary,
+        beta=_safe(beta, r, b),
+        tracking_error=tracking_error(r, b, periods_per_year),
+        information_ratio=_safe(information_ratio, r, b, periods_per_year),
+    )
+
+
+def historical_var_cvar(losses: np.ndarray, confidence: float) -> tuple[float, float]:
+    """Value at risk and conditional value at risk of equally likely scenario losses.
+
+    Rockafellar & Uryasev (2000): ``CVaR = min_a a + E[(L - a)+] / (1 - beta)``, attained
+    at ``a = VaR``, the ``ceil(beta * T)``-th smallest loss. When ``(1 - beta) T`` is an
+    integer ``k`` this is the mean of the ``k`` largest losses. Losses are positive.
+    """
+    x = np.sort(np.asarray(losses, dtype=float))
+    if x.size == 0 or not np.isfinite(x).all():
+        raise InvalidInputError("Losses must be a non-empty array of finite numbers.")
+    if not 0.0 < confidence < 1.0:
+        raise InvalidInputError("Confidence level must be strictly between 0 and 1.")
+    t = x.size
+    var = float(x[max(0, int(np.ceil(confidence * t - 1e-9)) - 1)])
+    cvar = var + float(np.maximum(x - var, 0.0).sum()) / ((1.0 - confidence) * t)
+    return var, cvar

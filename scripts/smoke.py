@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Smoke test for a deployed Ardentum: the API, the website and Supabase sign-in settings.
+
+    python3 scripts/smoke.py --api https://<api> --site https://<site> \\
+        [--supabase https://<ref>.supabase.co --publishable-key sb_publishable_...]
+
+Checks what can be seen from outside: health, production settings, CORS for the site,
+live data sources (Ken French, ECB rates via Frankfurter, BIS policy rates, WikiRate, FRED
+if configured), a background calculation, the settings baked into the website at build time, and which
+sign-in providers are switched on. Read-only apart from one anonymous background job,
+which expires after a day. Standard library only. Exits 1 if a required check fails;
+warnings are optional items.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlparse
+
+UA = "ardentum-smoke/1"
+# Every table the API's migrations create (backend/migrations), including Alembic's own.
+DATABASE_TABLES = (
+    "users",
+    "datasets",
+    "portfolios",
+    "esg_overlays",
+    "jobs",
+    "provider_cache",
+    "rate_limit_counters",
+    "usage_counts",
+    "alembic_version",
+)
+API_HEADERS = (
+    "strict-transport-security",
+    "content-security-policy",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "cross-origin-resource-policy",
+)
+SITE_HEADERS = (
+    "strict-transport-security",
+    "content-security-policy",
+    "x-content-type-options",
+    "x-frame-options",
+    "referrer-policy",
+    "permissions-policy",
+    "cross-origin-opener-policy",
+)
+KF_UNIVERSE = {
+    "dataset_id": "kf12",
+    "tickers": ["NODUR", "HLTH", "MONEY"],
+    "start": "2015-01-01",
+    "frequency": "monthly",
+}
+
+
+@dataclass
+class Response:
+    status: int
+    headers: dict[str, str]
+    text: str
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+def request(
+    method: str,
+    url: str,
+    body: object | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 60,
+) -> Response:
+    data = json.dumps(body).encode() if body is not None else None
+    # Marked as monitoring so the check is left out of the public usage counts.
+    h = {"User-Agent": UA, "X-Ardentum-Monitor": "1", **(headers or {})}
+    if data is not None:
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            hdrs = {k.lower(): v for k, v in r.headers.items()}
+            return Response(r.status, hdrs, r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        hdrs = {k.lower(): v for k, v in e.headers.items()}
+        return Response(e.code, hdrs, e.read().decode("utf-8", "replace"))
+
+
+class Report:
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str]] = []
+
+    def add(self, level: str, name: str, detail: str) -> None:
+        self.rows.append((level, name, detail))
+        print(f"{level:4}  {name}: {detail}", flush=True)
+
+    def ok(self, name: str, detail: str = "") -> None:
+        self.add("PASS", name, detail)
+
+    def fail(self, name: str, detail: str) -> None:
+        self.add("FAIL", name, detail)
+
+    def warn(self, name: str, detail: str) -> None:
+        self.add("WARN", name, detail)
+
+    def check(self, name: str, fn: Any) -> Any:
+        try:
+            return fn()
+        except Exception as e:  # a check that crashes is a failed check
+            self.fail(name, f"{type(e).__name__}: {e}")
+            return None
+
+    @property
+    def failed(self) -> bool:
+        return any(level == "FAIL" for level, _, _ in self.rows)
+
+    def summary_markdown(self) -> str:
+        lines = ["| Result | Check | Detail |", "|---|---|---|"]
+        for level, name, detail in self.rows:
+            lines.append(f"| {level} | {name} | {detail.replace('|', '/')} |")
+        return "\n".join(lines) + "\n"
+
+
+def secrets_in(code: str) -> list[str]:
+    """Secret keys in code sent to browsers (frontend/scripts/check-client-secrets.mjs
+    runs the same check at build time)."""
+    found = []
+    if re.search(r"sb_secret_[A-Za-z0-9_-]{10,}", code):
+        found.append("a Supabase secret key")
+    if re.search(r"GOCSPX-[A-Za-z0-9_-]{10,}", code):
+        found.append("a Google OAuth client secret")
+    for payload in re.findall(r"eyJ[A-Za-z0-9_-]{10,}\.(eyJ[A-Za-z0-9_-]{10,})\.", code):
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except ValueError:
+            continue
+        if isinstance(claims, dict) and claims.get("role") == "service_role":
+            found.append("a Supabase service-role key")
+    return found
+
+
+def error_message(r: Response) -> str:
+    try:
+        return str(r.json()["error"]["message"])
+    except Exception:
+        return r.text[:200]
+
+
+def describe(r: Response) -> str:
+    """Status, serving host and the start of the page, to tell apart a wrong address,
+    a missing deployment and a build without the expected files."""
+    text = re.sub(r"<[^>]+>", " ", r.text)
+    text = re.sub(r"\s+", " ", text).strip()[:160]
+    server = r.headers.get("server", "?")
+    return f"HTTP {r.status} from {server}: {text!r}"
+
+
+def git(*args: str) -> tuple[int, str]:
+    """Runs git in this checkout; (exit code, output), or (-1, "") without git."""
+    try:
+        done = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+    return done.returncode, done.stdout.strip()
+
+
+def deploy_freshness(rep: Report, running: str | None) -> None:
+    """Whether the API runs main's latest backend change, as this checkout knows main.
+
+    The host deploys main, so a branch's own backend changes are not expected there yet.
+    """
+    name = "API deploy is current"
+    if not running:
+        rep.warn(
+            name,
+            "the API does not say which commit it runs (it predates this check, or its host "
+            "does not report it). If checks for newer features fail with HTTP 404, the deploy "
+            "is behind main: on Render, Manual Deploy > Deploy latest commit.",
+        )
+        return
+    code, latest = git("log", "-1", "--format=%H", "origin/main", "--", "backend")
+    if code != 0 or not latest:  # no origin/main here (a bare download): use this checkout
+        code, latest = git("log", "-1", "--format=%H", "--", "backend")
+    if code != 0 or not latest:
+        rep.warn(name, f"the API runs {running[:7]}; no git history here to compare with")
+        return
+    _, when = git("log", "-1", "--format=%cs %s", latest)
+    code, _ = git("merge-base", "--is-ancestor", latest, running)
+    if code == 0:
+        rep.ok(
+            name,
+            f"the API runs {running[:7]}, which includes the latest backend change {latest[:7]}",
+        )
+    elif code == 1:
+        rep.fail(
+            name,
+            f"the API runs {running[:7]}, but the backend changed in {latest[:7]} ({when}). "
+            "Its host has not deployed it: on Render, open the service, Manual Deploy > Deploy "
+            "latest commit, and check that Auto-Deploy is On.",
+        )
+    else:
+        rep.warn(name, f"the API runs {running[:7]}, a commit this checkout does not know")
+
+
+def check_api(rep: Report, api: str, site: str) -> None:
+    v1 = api.rstrip("/") + "/api/v1"
+
+    def health() -> None:
+        # A free Render instance may be asleep: the first request can take a minute.
+        start = time.monotonic()
+        r = request("GET", f"{v1}/health", timeout=180)
+        waited = time.monotonic() - start
+        if r.status != 200:
+            rep.fail("API health", f"HTTP {r.status}: {r.text[:200]}")
+            return
+        rep.ok("API health", f"answered in {waited:.1f} s")
+
+    def health_db() -> None:
+        r = request("GET", f"{v1}/health/db", timeout=60)
+        if r.status == 200 and r.json().get("database") == "ok":
+            rep.ok("Database", "reachable")
+        else:
+            rep.fail("Database", f"HTTP {r.status}: {r.text[:200]}")
+
+    def meta() -> None:
+        r = request("GET", f"{v1}/meta")
+        m = r.json()
+        detail = f"version {m.get('version')}, environment {m.get('environment')}"
+        if m.get("environment") == "production" and m.get("auth_mode") == "supabase":
+            rep.ok("Production settings", detail + ", Supabase sign-in")
+        else:
+            rep.fail("Production settings", detail + f", auth {m.get('auth_mode')}")
+        deploy_freshness(rep, m.get("commit"))
+
+    def cors() -> None:
+        r = request(
+            "OPTIONS",
+            f"{v1}/optimise",
+            headers={
+                "Origin": site,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        allowed = r.headers.get("access-control-allow-origin")
+        if r.status == 200 and allowed == site:
+            rep.ok("CORS", f"the API accepts calls from {site}")
+        else:
+            rep.fail(
+                "CORS",
+                f"the API refuses calls from {site} (HTTP {r.status}, allowed: {allowed}). "
+                f'Set ARDENTUM_CORS_ORIGINS to ["{site}"] on the API host and redeploy.',
+            )
+
+    def auth_guard() -> None:
+        me = request("GET", f"{v1}/auth/me")
+        dev = request("POST", f"{v1}/auth/dev-login", {"email": "smoke@example.com"})
+        if me.status == 401 and dev.status != 200:
+            rep.ok("Sign-in required", "account endpoints refuse anonymous and dev sign-in")
+        else:
+            rep.fail("Sign-in required", f"/auth/me HTTP {me.status}, dev-login HTTP {dev.status}")
+
+    def api_headers() -> None:
+        r = request("GET", f"{v1}/health")
+        missing = [h for h in API_HEADERS if h not in r.headers]
+        server = r.headers.get("server", "")
+        if missing:
+            rep.warn("API security headers", "missing: " + ", ".join(missing))
+        elif "uvicorn" in server.lower():
+            rep.warn("API security headers", f"present, but the server names itself ({server})")
+        else:
+            rep.ok("API security headers", f"{len(API_HEADERS)} present")
+
+    def ken_french() -> None:
+        # The first analysis downloads and caches the industry returns.
+        start = time.monotonic()
+        r = request("POST", f"{v1}/analytics", {"universe": KF_UNIVERSE}, timeout=300)
+        if r.status != 200:
+            rep.fail("Ken French data", f"HTTP {r.status}: {error_message(r)}")
+            return
+        rep.ok("Ken French data", f"analytics on 3 industries in {time.monotonic() - start:.1f} s")
+
+    def risk_free() -> None:
+        r = request("POST", f"{v1}/risk-free", {"source": "kenfrench_rf", "start": "2015-01-01"})
+        if r.status == 200:
+            rep.ok("Risk-free rate (Fama-French)", f"{r.json()['rate']:.4f} a year since 2015")
+        else:
+            rep.fail("Risk-free rate (Fama-French)", f"HTTP {r.status}: {error_message(r)}")
+        sources = {s["id"]: s for s in request("GET", f"{v1}/risk-free/sources").json()}
+        if not sources.get("fred_dgs3mo", {}).get("available"):
+            rep.warn("FRED", "no FRED key on the API (optional; guide step 10)")
+            return
+        r = request("POST", f"{v1}/risk-free", {"source": "fred_dgs3mo", "start": "2015-01-01"})
+        if r.status == 200:
+            rep.ok("FRED", f"3-month T-bill {r.json()['rate']:.4f} a year since 2015")
+        else:
+            rep.fail("FRED", f"HTTP {r.status}: {error_message(r)}")
+
+    def fx() -> None:
+        body = {"universe": {**KF_UNIVERSE, "base_currency": "EUR"}}
+        r = request("POST", f"{v1}/analytics", body, timeout=180)
+        if r.status == 200:
+            rep.ok("ECB exchange rates (Frankfurter)", "analytics in EUR succeeded")
+        else:
+            rep.fail("ECB exchange rates (Frankfurter)", f"HTTP {r.status}: {error_message(r)}")
+            return
+        hedged = {"universe": {**KF_UNIVERSE, "base_currency": "EUR", "currency_hedged": True}}
+        r = request("POST", f"{v1}/analytics", hedged, timeout=180)
+        if r.status == 200:
+            rep.ok("Policy rates for hedging (BIS)", "hedged analytics in EUR succeeded")
+        else:
+            rep.fail("Policy rates for hedging (BIS)", f"HTTP {r.status}: {error_message(r)}")
+
+    def wikirate() -> None:
+        name = "WikiRate open ESG data"
+        available = request("GET", f"{v1}/meta").json().get("open_esg_available")
+        if available is None:
+            rep.warn(name, "the deployed API predates WikiRate's new API; deploy the current code")
+            return
+        if not available:
+            rep.warn(
+                name,
+                "switched off: no WikiRate keys on the API (free account; guide step 10)",
+            )
+            return
+        r = request("GET", f"{v1}/esg/open/metrics?q=greenhouse&limit=5", timeout=120)
+        if r.status != 200:
+            rep.fail(name, f"HTTP {r.status}: {error_message(r)}")
+            return
+        if not r.json():
+            rep.fail(name, "search returned no metrics")
+            return
+        # Adidas AG lists this ISIN on wikirate.org; finding it checks the identifier
+        # lookup that automatic matching relies on.
+        c = request("GET", f"{v1}/esg/open/companies?q=DE000A1EWWW0", timeout=120)
+        if c.status == 200 and c.json():
+            found = c.json()[0]["name"]
+            rep.ok(name, f"{len(r.json())} metrics for 'greenhouse'; ISIN finds {found}")
+        elif c.status == 200:
+            rep.fail(name, "no company found for the ISIN DE000A1EWWW0 (Adidas AG)")
+        else:
+            rep.fail(name, f"ISIN lookup, HTTP {c.status}: {error_message(c)}")
+
+    def optimise() -> None:
+        r = request("POST", f"{v1}/optimise", {"universe": KF_UNIVERSE}, timeout=180)
+        if r.status != 200:
+            rep.fail("Optimisation", f"HTTP {r.status}: {error_message(r)}")
+            return
+        result = r.json()["result"]
+        total = sum(h["weight"] for h in result["holdings"])
+        if abs(total - 1) < 1e-6:
+            rep.ok("Optimisation", f"weights sum to 1, solver {result['solver']}")
+        else:
+            rep.fail("Optimisation", f"weights sum to {total}")
+
+    def crisis_replay() -> None:
+        body = {
+            "universe": KF_UNIVERSE,
+            "portfolio": {"name": "Smoke", "weights": {"NODUR": 0.4, "HLTH": 0.3, "MONEY": 0.3}},
+            "episodes": ["covid_2020"],
+        }
+        r = request("POST", f"{v1}/stress", body, timeout=300)
+        if r.status != 200:
+            rep.fail("Crisis replay", f"HTTP {r.status}: {error_message(r)}")
+            return
+        e = r.json()["episodes"][0]
+        if not e["available"]:
+            rep.fail("Crisis replay", f"COVID-19 crash not available: {e['reason']}")
+            return
+        split = sum(a["contribution"] for a in e["assets"])
+        market = e["benchmark_total_return"]
+        if abs(split - e["total_return"]) > 1e-9 or market is None or market >= 0:
+            rep.fail("Crisis replay", f"inconsistent result (market return {market})")
+            return
+        rep.ok(
+            "Crisis replay",
+            f"COVID-19 crash: portfolio {e['total_return']:.1%}, market {market:.1%}",
+        )
+
+    def factor_exposure() -> None:
+        body = {
+            "universe": KF_UNIVERSE,
+            "portfolio": {"name": "Smoke", "weights": {"NODUR": 0.4, "HLTH": 0.3, "MONEY": 0.3}},
+        }
+        r = request("POST", f"{v1}/factors", body, timeout=300)
+        if r.status != 200:
+            rep.fail("Factor exposure", f"HTTP {r.status}: {error_message(r)}")
+            return
+        d = r.json()
+        market = next(f["loading"] for f in d["factors"] if f["key"] == "MKT_RF")
+        # Three large US industries move with the market: a loading far from 1 or a low
+        # R-squared would mean misaligned dates or factors.
+        if not (0.4 < market < 1.6 and d["r_squared"] > 0.5):
+            rep.fail(
+                "Factor exposure", f"market loading {market:.2f}, R-squared {d['r_squared']:.2f}"
+            )
+            return
+        rep.ok(
+            "Factor exposure",
+            f"market loading {market:.2f}, R-squared {d['r_squared']:.0%}, "
+            f"{d['observations']} months",
+        )
+
+    def trade_list() -> None:
+        body = {
+            "holdings": {"A": 6000.0, "B": 4000.0},
+            "target": {"name": "Smoke", "weights": {"A": 0.5, "B": 0.5}},
+            "new_money": 0,
+            "transaction_cost_bps": 0,
+        }
+        r = request("POST", f"{v1}/trades", body)
+        if r.status != 200:
+            rep.fail("Trade list", f"HTTP {r.status}: {error_message(r)}")
+            return
+        trades = {t["ticker"]: t["trade"] for t in r.json()["trades"]}
+        if abs(trades["A"] + 1000) < 1e-6 and abs(trades["B"] - 1000) < 1e-6:
+            rep.ok("Trade list", "sell 1,000 of A, buy 1,000 of B, as expected")
+        else:
+            rep.fail("Trade list", f"unexpected trades {trades}")
+
+    def background_job() -> None:
+        body = {
+            "kind": "montecarlo",
+            "request": {
+                "universe": KF_UNIVERSE,
+                "weights": {"NODUR": 0.4, "HLTH": 0.3, "MONEY": 0.3},
+                "n_paths": 1000,
+                "horizon_years": 5,
+                "seed": 7,
+            },
+        }
+        start = time.monotonic()
+        r = request("POST", f"{v1}/jobs", body)
+        if r.status != 202:
+            rep.fail("Background job", f"HTTP {r.status}: {error_message(r)}")
+            return
+        job = r.json()
+        for _ in range(12):
+            if job["status"] in ("succeeded", "failed"):
+                break
+            job = request("GET", f"{v1}/jobs/{job['id']}?wait=20", timeout=60).json()
+        took = f"{time.monotonic() - start:.1f} s"
+        if job["status"] == "succeeded" and "percentiles" in (job.get("result") or {}):
+            rep.ok("Background job", f"Monte Carlo simulation finished in {took}")
+        else:
+            rep.fail("Background job", f"status {job['status']} after {took}: {job.get('error')}")
+
+    def usage() -> None:
+        r = request("GET", f"{v1}/usage")
+        if r.status != 200:
+            rep.fail("Usage counts", f"HTTP {r.status}: {error_message(r)}")
+            return
+        u = r.json()
+        counted = (
+            f"{u['total_calculations']} calculations counted since {u['since']}"
+            if u["since"]
+            else "nothing counted yet"
+        )
+        rep.ok("Usage counts", f"{counted}; this check's own calculations are not counted")
+
+    rep.check("API health", health)
+    if rep.rows and rep.rows[-1][:2] == ("FAIL", "API health"):
+        return  # nothing else can work
+    for name, fn in [
+        ("Database", health_db),
+        ("Production settings", meta),
+        ("CORS", cors),
+        ("Sign-in required", auth_guard),
+        ("API security headers", api_headers),
+        ("Ken French data", ken_french),
+        ("Risk-free rate (Fama-French)", risk_free),
+        ("ECB exchange rates (Frankfurter)", fx),
+        ("WikiRate open ESG data", wikirate),
+        ("Optimisation", optimise),
+        ("Crisis replay", crisis_replay),
+        ("Factor exposure", factor_exposure),
+        ("Trade list", trade_list),
+        ("Background job", background_job),
+        ("Usage counts", usage),
+    ]:
+        rep.check(name, fn)
+
+
+def check_site(rep: Report, site: str, api: str, supabase: str | None, key: str | None) -> None:
+    base = site.rstrip("/")
+
+    def pages() -> None:
+        r = request("GET", base + "/")
+        if r.status != 200 or "shows its working" not in r.text:
+            # Tell apart "nothing deployed at this address" from a routing problem.
+            index = request("GET", base + "/index.html")
+            hint = (
+                "no deployment is serving this address; check the project's address and "
+                "its latest deployment in Cloudflare (Workers & Pages > project > Deployments)"
+                if index.status == 404
+                else f"/index.html gives HTTP {index.status}"
+            )
+            rep.fail("Website", f"landing page not found at {base}/; {describe(r)}; {hint}")
+            return
+        rep.ok("Website", "landing page loads")
+        missing = [h for h in SITE_HEADERS if h not in r.headers]
+        csp = r.headers.get("content-security-policy", "")
+        if missing:
+            rep.warn("Security headers", "missing: " + ", ".join(missing))
+        elif urlparse(api).netloc not in csp:
+            rep.fail(
+                "Security headers",
+                "the Content-Security-Policy does not allow the API, so the site cannot call "
+                "it; check NEXT_PUBLIC_API_BASE and that the build ran scripts/add-csp.mjs",
+            )
+        else:
+            rep.ok("Security headers", f"{len(SITE_HEADERS)} present, policy allows the API")
+
+        # Settings are baked into the JavaScript at build time; look for them.
+        scripts: set[str] = set()
+        for path in ("/", "/app"):
+            html = request("GET", base + path).text
+            scripts |= set(re.findall(r'src="(/_next/static/[^"]+?\.js)"', html))
+        code = "".join(request("GET", base + s).text for s in sorted(scripts))
+        wanted = {
+            "NEXT_PUBLIC_API_BASE": urlparse(api).netloc,
+            "NEXT_PUBLIC_SUPABASE_URL": urlparse(supabase).netloc if supabase else None,
+            "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY": key,
+        }
+        leaks = secrets_in(code)
+        if leaks:
+            rep.fail("No secrets in the website", "found: " + ", ".join(leaks))
+        else:
+            rep.ok("No secrets in the website", "no secret keys in the website's code")
+        for var, value in wanted.items():
+            if value is None:
+                continue
+            if value in code:
+                rep.ok(f"Build setting {var}", "present in the website's code")
+            else:
+                rep.fail(
+                    f"Build setting {var}",
+                    "not found in the website's code; set it in Cloudflare Pages > Settings > "
+                    "Variables and Secrets, then retry the latest deployment",
+                )
+
+    def legal() -> None:
+        for path, title in (
+            ("/terms", "Terms of Service"),
+            ("/privacy", "Privacy Policy"),
+            ("/cookies", "Cookie Policy"),
+            ("/licences", "Licences"),
+        ):
+            r = request("GET", base + path)
+            if r.status != 200 or title not in r.text:
+                rep.fail(f"Page {path}", f"HTTP {r.status}; heading '{title}' not found")
+            elif "has not set its operator name" in r.text:
+                rep.warn(
+                    f"Page {path}",
+                    "operator name, contact and governing law not set (NEXT_PUBLIC_LEGAL_*, "
+                    "guide step 11)",
+                )
+            else:
+                rep.ok(f"Page {path}", "legal details filled in")
+
+    def public_pages() -> None:
+        for path, heading in (
+            ("/tour", "Ardentum in eight steps"),
+            ("/usage", "How much Ardentum is used"),
+            ("/classroom", "Teach with Ardentum"),
+            ("/classroom/worksheet", "the optimiser"),
+            ("/glossary", "What the terms mean"),
+            ("/app/crises", "Crisis replay"),
+            ("/app/factors", "Factor exposure"),
+            ("/app/trades", "Trade list"),
+        ):
+            r = request("GET", base + path)
+            if r.status == 200 and heading in r.text:
+                rep.ok(f"Page {path}", "loads")
+            else:
+                rep.fail(f"Page {path}", f"HTTP {r.status}; heading '{heading}' not found")
+
+    def screenshots() -> None:
+        r = request("GET", base + "/screenshots/optimise-light.png")
+        if r.status == 200:
+            rep.ok("Screenshots", "landing-page images load")
+        else:
+            rep.fail("Screenshots", f"HTTP {r.status}")
+
+    rep.check("Website", pages)
+    rep.check("Legal pages", legal)
+    rep.check("Public and new workspace pages", public_pages)
+    rep.check("Screenshots", screenshots)
+
+
+def check_supabase(rep: Report, supabase: str, key: str) -> None:
+    base = supabase.rstrip("/")
+
+    def providers() -> None:
+        r = request("GET", f"{base}/auth/v1/settings", headers={"apikey": key})
+        if r.status != 200:
+            rep.fail("Supabase", f"HTTP {r.status}: {r.text[:200]}")
+            return
+        external = r.json().get("external", {})
+        for p in ("google", "github"):
+            if external.get(p):
+                rep.ok(f"Sign-in with {p.title()}", "switched on in Supabase")
+            else:
+                rep.fail(
+                    f"Sign-in with {p.title()}",
+                    "off; Supabase > Authentication > Sign In / Providers (guide step 6)",
+                )
+
+    def signing_keys() -> None:
+        keys = request("GET", f"{base}/auth/v1/.well-known/jwks.json").json().get("keys", [])
+        if keys:
+            algs = sorted({k.get("alg", "?") for k in keys})
+            rep.ok("Token signing keys", f"published ({', '.join(algs)}); the API verifies them")
+        else:
+            rep.fail(
+                "Token signing keys",
+                "the project still signs with the legacy shared secret, so the API cannot "
+                "verify sign-ins unless ARDENTUM_SUPABASE_JWT_SECRET is set. Migrate: "
+                "Supabase > Project Settings > JWT Keys (guide step 2.4)",
+            )
+
+    def data_api_closed() -> None:
+        # The website's public key must not reach the app's tables through Supabase's own
+        # Data API (/rest/v1). limit=0 asks for no rows, so nothing personal is fetched.
+        statuses = {}
+        for table in DATABASE_TABLES:
+            r = request("GET", f"{base}/rest/v1/{table}?select=*&limit=0", headers={"apikey": key})
+            statuses[table] = r.status
+        readable = [t for t, s in statuses.items() if s == 200]
+        unclear = [f"{t} HTTP {s}" for t, s in statuses.items() if s not in (200, 401, 403, 404)]
+        if readable:
+            rep.fail(
+                "Database closed to the public key",
+                f"anyone with the website's key can use {', '.join(readable)} through "
+                "Supabase's Data API; deploy the API so migration 0007 runs (row-level security)",
+            )
+        elif unclear:
+            rep.warn(
+                "Database closed to the public key", "unexpected answers: " + ", ".join(unclear)
+            )
+        else:
+            rep.ok("Database closed to the public key", f"all {len(statuses)} tables refused")
+
+    rep.check("Supabase", providers)
+    rep.check("Token signing keys", signing_keys)
+    rep.check("Database closed to the public key", data_api_closed)
+
+
+def plain_url(rep: Report, name: str, value: str) -> str:
+    """Accept a value pasted as a Markdown link, [url](url), but flag it: other tools
+    (the keep-alive's curl, the website build) would use it as written and fail."""
+    m = re.fullmatch(r"\s*\[([^\]]+)\]\(([^)]+)\)\s*", value)
+    if not m:
+        return value.strip()
+    rep.fail(
+        f"Setting {name}",
+        f"written as a Markdown link ({value}); change it to the plain address {m.group(2)}",
+    )
+    return m.group(2).strip()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("--api", required=True, help="API base URL")
+    ap.add_argument("--site", required=True, help="website URL")
+    ap.add_argument("--supabase", help="Supabase project URL")
+    ap.add_argument("--publishable-key", help="Supabase publishable key (public)")
+    args = ap.parse_args()
+
+    rep = Report()
+    api = plain_url(rep, "API_URL", args.api)
+    site = plain_url(rep, "SITE_URL", args.site).rstrip("/")
+    supabase = plain_url(rep, "SUPABASE_URL", args.supabase) if args.supabase else None
+    check_api(rep, api, site)
+    check_site(rep, site, api, supabase, args.publishable_key)
+    if supabase and args.publishable_key:
+        check_supabase(rep, supabase, args.publishable_key)
+
+    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("## Live smoke test\n\n" + rep.summary_markdown())
+    n_fail = sum(1 for level, _, _ in rep.rows if level == "FAIL")
+    n_warn = sum(1 for level, _, _ in rep.rows if level == "WARN")
+    print(f"\n{len(rep.rows)} checks: {n_fail} failed, {n_warn} warnings")
+    return 1 if rep.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,60 @@
+# Render Blueprint for the API (free plan: no card needed). Dashboard: New > Blueprint >
+# this repository. Values marked `sync: false` are asked for once, when the Blueprint is
+# created. See docs/SETUP_GUIDE.md step 7A.
+services:
+  - type: web
+    name: ardentum-api
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/v1/health
+    # Deploy every commit on main. Changes reach main through pull requests whose CI has
+    # passed; "checksPass" would also wait for the live smoke test, which can fail for
+    # reasons outside the code (e.g. the website host) and then block every deploy.
+    autoDeployTrigger: commit
+    buildFilter:
+      paths:
+        - backend/**
+    envVars:
+      - key: ARDENTUM_ENV
+        value: production
+      - key: ARDENTUM_AUTH_MODE
+        value: supabase
+      - key: ARDENTUM_TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: ARDENTUM_RATE_LIMIT_STORE
+        value: database
+      # Random key for hashing client IP addresses in rate-limit counters (never stored raw).
+      # Created when Render syncs this Blueprint; until then each start draws its own key.
+      - key: ARDENTUM_RATE_LIMIT_SECRET
+        generateValue: true
+      # Cloudflare preview builds (<hash>.<project>.pages.dev) may call the API too.
+      - key: ARDENTUM_CORS_ORIGIN_REGEX
+        value: ^https://[a-z0-9-]+\.ardentum-frontend\.pages\.dev$
+      # One worker fits the free plan's 512 MB (about 250 MB at peak).
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # https://<ref>.supabase.co
+      - key: ARDENTUM_SUPABASE_URL
+        sync: false
+      # JSON list, e.g. ["https://ardentum.pages.dev"]
+      - key: ARDENTUM_CORS_ORIGINS
+        sync: false
+      # Open ESG data: both values from a free account at wikirate.org (account menu, API
+      # access). Without them the feature says it is switched off. The token is secret.
+      - key: ARDENTUM_WIKIRATE_PUBLISHABLE_KEY
+        sync: false
+      - key: ARDENTUM_WIKIRATE_API_TOKEN
+        sync: false
+      # Optional: free key from fredaccount.stlouisfed.org (3-month Treasury bill rate)
+      - key: ARDENTUM_FRED_API_KEY
+        sync: false
+      # Supabase transaction pooler URL (port 6543), with the password filled in
+      - key: ARDENTUM_DATABASE_URL
+        sync: false
+      # Supabase secret key (sb_secret_...); lets account deletion remove the sign-in record
+      - key: ARDENTUM_SUPABASE_SERVICE_KEY
+        sync: false
